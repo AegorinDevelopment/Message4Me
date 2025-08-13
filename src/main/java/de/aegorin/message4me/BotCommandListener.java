@@ -1,28 +1,37 @@
 package de.aegorin.message4me;
 
-import net.dv8tion.jda.api.entities.Guild;
-import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
-import net.dv8tion.jda.api.events.interaction.ModalInteractionEvent;
-import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
-import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
-import net.dv8tion.jda.api.events.session.ReadyEvent;
-import net.dv8tion.jda.api.hooks.ListenerAdapter;
-import net.dv8tion.jda.api.interactions.commands.build.Commands;
-import net.dv8tion.jda.api.interactions.components.ActionRow;
-import net.dv8tion.jda.api.interactions.components.buttons.Button;
-import net.dv8tion.jda.api.interactions.components.text.TextInput;
-import net.dv8tion.jda.api.interactions.components.text.TextInputStyle;
-import net.dv8tion.jda.api.interactions.modals.Modal;
-import org.jetbrains.annotations.NotNull;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.*;
+import java.util.regex.*;
 
-import java.util.Objects;
+import org.jetbrains.annotations.*;
+import org.slf4j.*;
+
+import net.dv8tion.jda.api.entities.*;
+import net.dv8tion.jda.api.entities.channel.concrete.*;
+import net.dv8tion.jda.api.entities.channel.middleman.*;
+import net.dv8tion.jda.api.events.interaction.*;
+import net.dv8tion.jda.api.events.interaction.command.*;
+import net.dv8tion.jda.api.events.interaction.component.*;
+import net.dv8tion.jda.api.events.session.*;
+import net.dv8tion.jda.api.hooks.*;
+import net.dv8tion.jda.api.interactions.commands.build.*;
+import net.dv8tion.jda.api.interactions.components.*;
+import net.dv8tion.jda.api.interactions.components.buttons.*;
+import net.dv8tion.jda.api.interactions.components.text.*;
+import net.dv8tion.jda.api.interactions.modals.*;
 
 public class BotCommandListener extends ListenerAdapter {
     private static final Logger log = LoggerFactory.getLogger(BotCommandListener.class);
 
     private static final String COMMAND = "say4me";
+
+    /**
+     * Matches @tokens composed of typical username characters (no spaces).
+     * This intentionally avoids matching email-like parts or words in the middle of identifiers.
+     *
+     */
+    private static final Pattern AT_TOKEN = Pattern.compile("(?<![\\w@])@([A-Za-z0-9._-]{2,32})");
+    private static final Pattern HASH_TOKEN = Pattern.compile("(?<![\\w#])#([A-Za-z0-9._-]{2,100})");
 
     private static final String BTN_ID_PREFIX = "preview:";
     private static final String BTN_SEND_ID = "preview:send";
@@ -159,7 +168,6 @@ public class BotCommandListener extends ListenerAdapter {
             return;
         }
 
-        // Stateless preview: ephemeral message is exactly the content to be sent
         var confirmButton = Button.success(BTN_SEND_ID, "Send");
         var cancelButton = Button.danger(BTN_CANCEL_ID, "Abort");
 
@@ -170,6 +178,75 @@ public class BotCommandListener extends ListenerAdapter {
                         ok -> log.info("Ephemeral preview sent (from modal)"),
                         err -> log.error("Failed to send ephemeral preview (from modal)", err)
                 );
+    }
+
+    private static String replaceAtMentionsWithIds(Guild guild, String text) {
+        if (text == null || text.isBlank()) {
+            return text;
+        }
+        Matcher m = AT_TOKEN.matcher(text);
+        StringBuilder sb = new StringBuilder();
+        while (m.find()) {
+            String token = m.group(1);
+            Member uniqueMember = null;
+
+            var byName = guild.getMembersByName(token, true);
+            if (byName.size() == 1) {
+                uniqueMember = byName.getFirst();
+            } else if (byName.isEmpty()) {
+                var byDisplay = guild.getMembersByEffectiveName(token, true);
+                if (byDisplay.size() == 1) {
+                    uniqueMember = byDisplay.getFirst();
+                } else if (byDisplay.size() > 1) {
+                    log.info("Ambiguous @{} -> {} candidates by display name; leaving as-is", token, byDisplay.size());
+                }
+            } else {
+                log.info("Ambiguous @{} -> {} candidates by username; leaving as-is", token, byName.size());
+            }
+
+            String replacement = null;
+            if (uniqueMember != null) {
+                replacement = "<@%s>".formatted(uniqueMember.getId());
+            } else {
+                var roles = guild.getRolesByName(token, true);
+                if (roles.size() == 1) {
+                    replacement = "<@&%s>".formatted(roles.getFirst().getId());
+                } else if (roles.size() > 1) {
+                    log.info("Ambiguous @{} -> {} candidates by role name; leaving as-is", token, roles.size());
+                }
+            }
+
+            if (replacement != null) {
+                m.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+            } else {
+                m.appendReplacement(sb, Matcher.quoteReplacement(m.group(0)));
+            }
+        }
+        m.appendTail(sb);
+
+        String afterAt = sb.toString();
+        Matcher mHash = HASH_TOKEN.matcher(afterAt);
+        sb.setLength(0);
+        while (mHash.find()) {
+            String token = mHash.group(1);
+            String replacement = null;
+
+            var textChannels = guild.getTextChannelsByName(token, true);
+            if (textChannels.size() == 1) {
+                TextChannel ch = textChannels.getFirst();
+                replacement = "<#%s>".formatted(ch.getId());
+            } else if (textChannels.size() > 1) {
+                log.info("Ambiguous #{} -> {} candidates by text channel name; leaving as-is", token, textChannels.size());
+            }
+
+            if (replacement != null) {
+                mHash.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+            } else {
+                mHash.appendReplacement(sb, Matcher.quoteReplacement(mHash.group(0)));
+            }
+        }
+        mHash.appendTail(sb);
+        return sb.toString();
     }
 
     @Override
@@ -205,7 +282,11 @@ public class BotCommandListener extends ListenerAdapter {
                 }
 
                 log.info("Sending message to channel {} ({})", channel.getName(), channel.getId());
-                channel.sendMessage(content).queue(
+                String parsed = replaceAtMentionsWithIds(channel.getGuild(), content);
+                if (!parsed.equals(content)) {
+                    log.info("Converted @name mentions to ID mentions before sending.");
+                }
+                channel.sendMessage(parsed).queue(
                         ok -> {
                             log.info("Message sent successfully.");
                             event.editMessage("Message sent.")

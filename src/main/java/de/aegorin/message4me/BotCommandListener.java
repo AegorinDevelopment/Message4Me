@@ -28,7 +28,6 @@ public class BotCommandListener extends ListenerAdapter {
     /**
      * Matches @tokens composed of typical username characters (no spaces).
      * This intentionally avoids matching email-like parts or words in the middle of identifiers.
-     *
      */
     private static final Pattern AT_TOKEN = Pattern.compile("(?<![\\w@])@([A-Za-z0-9._-]{2,32})");
     private static final Pattern HASH_TOKEN = Pattern.compile("(?<![\\w#])#([A-Za-z0-9._-]{2,100})");
@@ -180,6 +179,14 @@ public class BotCommandListener extends ListenerAdapter {
                 );
     }
 
+    private static String replaceRoleMentionsWithIds(Guild guild, String text) {
+        List<Role> roles = guild.getRoles();
+        for (Role role : roles) {
+            text = text.replace("@" + role.getName(), "<@&%s>".formatted(role.getId()));
+        }
+        return text;
+    }
+
     private static String replaceAtMentionsWithIds(Guild guild, String text) {
         if (text == null || text.isBlank()) {
             return text;
@@ -283,6 +290,7 @@ public class BotCommandListener extends ListenerAdapter {
 
                 log.info("Sending message to channel {} ({})", channel.getName(), channel.getId());
                 String parsed = replaceAtMentionsWithIds(channel.getGuild(), content);
+                parsed = replaceRoleMentionsWithIds(channel.getGuild(), parsed);
                 if (!parsed.equals(content)) {
                     log.info("Converted @name mentions to ID mentions before sending.");
                 }
